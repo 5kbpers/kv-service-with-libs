@@ -1,0 +1,12 @@
+syntax = "proto3";
+package kvpb;
+
+import "kvrpcpb.proto";
+import "eraftpb.proto";
+
+service kv {
+  rpc Get(kvrpcpb.KvReq) returns (kvrpcpb.GetResp) {}
+  rpc Put(kvrpcpb.KvReq) returns (kvrpcpb.PutResp) {}
+  rpc Delete(kvrpcpb.KvReq) returns (kvrpcpb.DeleteResp) {}
+  rpc Raft(eraftpb.Message) returns(kvrpcpb.RaftDone) {}
+}

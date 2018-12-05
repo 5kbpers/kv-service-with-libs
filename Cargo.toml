@@ -1,0 +1,23 @@
+[package]
+name = "kv-service-with-libs"
+version = "0.1.0"
+authors = ["minghuatang <hustmh@gmail.com>"]
+edition = "2018"
+
+[lib]
+name = "kv"
+
+[[bin]]
+name = "kv-server"
+
+[[bin]]
+name = "kv-client"
+
+[dependencies]
+raft = "0.4"
+grpcio = { version = "0.4", features = [ "secure" ] }
+protobuf = "~2.0"
+futures = "0.1"
+
+[dependencies.rocksdb]
+git = "https://github.com/pingcap/rust-rocksdb.git"

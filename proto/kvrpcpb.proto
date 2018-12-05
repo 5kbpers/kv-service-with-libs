@@ -1,0 +1,36 @@
+syntax = "proto3";
+package kvrpcpb;
+
+enum RespErr {
+  OK = 0;
+  ErrWrongLeader = 1;
+}
+
+enum ReqType {
+  Get = 0;
+  Put = 1;
+  Delete = 2;
+}
+
+message KvReq {
+  string key = 1;
+  string value = 2;
+  uint64 client_id = 3;
+  uint64 seq = 4;
+  ReqType req_type = 5;
+}
+
+message GetResp {
+  string value = 1;
+  RespErr err = 2;
+}
+
+message PutResp {
+  RespErr err = 1;
+}
+
+message DeleteResp {
+  RespErr err = 1;
+}
+
+message RaftDone {}
