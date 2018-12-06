@@ -4,17 +4,17 @@ use std::sync::mpsc::{self, SyncSender, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use rocksdb::DB;
-use raft::eraftpb::{Entry, EntryType, Message};
+use raft::eraftpb::{Entry, EntryType, Message, ConfChange};
 use raft::{self, RawNode};
 
 use raft::storage::MemStorage as PeerStorage;
 // use super::peer_storage::PeerStorage;
-use super::kvproto::kvrpcpb;
 use super::util;
 
 pub enum PeerMessage {
     Propose(Vec<u8>),
     Message(Message),
+    ConfChange(ConfChange),
 }
 
 pub struct Peer {
@@ -57,7 +57,13 @@ impl Peer {
                 Ok(PeerMessage::Propose(p)) => {
                     match self.raft_group.propose(vec![], p) {
                         Ok(_) => (),
-                        Err(_) => self.apply_message(&Entry::new()),
+                        Err(_) => self.apply_message(Entry::new()),
+                    }
+                },
+                Ok(PeerMessage::ConfChange(cc)) => {
+                    match self.raft_group.propose_conf_change(vec![], cc.clone()) {
+                        Ok(_) => (),
+                        Err(_) => println!("conf change failed: {:?}", cc),
                     }
                 },
                 Ok(PeerMessage::Message(m)) => self.raft_group.step(m).unwrap(),
@@ -88,7 +94,7 @@ impl Peer {
         if is_leader {
             let msgs = ready.messages.drain(..);
             for _msg in msgs {
-                self.send_message(&_msg);
+                Self::send_message(sender.clone(), _msg.clone());
             }
         }
 
@@ -110,7 +116,7 @@ impl Peer {
         if !is_leader {
             let msgs = ready.messages.drain(..);
             for _msg in msgs {
-                self.send_message(&_msg);
+                Self::send_message(sender.clone(), _msg.clone());
             }
         }
 
@@ -126,10 +132,12 @@ impl Peer {
                     continue;
                 }
 
-                if entry.get_entry_type() == EntryType::EntryNormal {
-                    self.apply_message(&entry);
-                } else if entry.get_entry_type() == EntryType::EntryConfChange {
-
+                match entry.get_entry_type() {
+                    EntryType::EntryNormal => self.apply_message(entry.clone()),
+                    EntryType::EntryConfChange => {
+                        let cc = util::parse_data(&entry.data);
+                        self.raft_group.apply_conf_change(&cc);
+                    }
                 }
             }
         }
@@ -138,15 +146,16 @@ impl Peer {
         self.raft_group.advance(ready);
     }
 
-    fn send_message(&self, msg: &Message) {
+    fn send_message(sender: SyncSender<Message>, msg: Message) {
         thread::spawn(move || {
-            
+            sender.send(msg).unwrap();
         });
     }
 
-    fn apply_message(&self, entry: &Entry) {
+    fn apply_message(&self, entry: Entry) {
+        let sender = self.apply_ch.clone();
         thread::spawn(move || {
-            
+            sender.send(entry).unwrap();
         });
     }
 }

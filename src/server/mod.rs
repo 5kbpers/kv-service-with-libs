@@ -13,21 +13,22 @@ use rocksdb::Writable;
 use protobuf::Message;
 use futures::sync::oneshot;
 use futures::Future;
-use grpcio::{Environment, RpcContext, ServerBuilder, UnarySink};
-use raft::eraftpb::{Message as RaftMessage, Entry};
+use grpcio::{Environment, RpcContext, ServerBuilder, UnarySink, EnvBuilder, ChannelBuilder};
+use raft::eraftpb::{Message as RaftMessage, Entry, ConfChange, EntryType, ConfChangeType};
 
 use super::kvproto;
 use super::kvproto::kvpb_grpc::{self, Kv, KvClient};
 use super::kvproto::kvrpcpb::*;
+use self::peer::PeerMessage;
 
 struct NotifyArgs(u64, String, RespErr);
 
 #[derive(Clone)]
-struct KvServer {
+pub struct KvServer {
     id: u64,
-    peers: Arc<HashMap<u64, KvClient>>,
+    peers: Arc<Mutex<HashMap<u64, KvClient>>>,
     engine: Arc<DB>,
-    rf_message_ch: SyncSender<peer::PeerMessage>,
+    rf_message_ch: SyncSender<PeerMessage>,
     notify_ch_map: Arc<Mutex<HashMap<u64, SyncSender<NotifyArgs>>>>,
 }
 
@@ -39,7 +40,7 @@ impl KvServer {
         let (rpc_sender, rpc_receiver) = mpsc::sync_channel(100);
         let mut kv_server = KvServer{
             id, 
-            peers: Arc::new(HashMap::new()), 
+            peers: Arc::new(Mutex::new(HashMap::new())), 
             engine,
             rf_message_ch: rf_sender,
             notify_ch_map: Arc::new(Mutex::new(HashMap::new())),
@@ -71,12 +72,18 @@ impl KvServer {
     }
 
     fn async_rpc_sender(&mut self, receiver: Receiver<RaftMessage>) {
-        let peers = self.peers.clone();
+        let l = self.peers.clone();
         thread::spawn(move || {
             loop {
                 match receiver.recv() {
                     Ok(m) => {
-
+                        let peers = l.lock().unwrap();
+                        let client = peers.get(&m.to);
+                        if let Some(c) = client {
+                            c.raft(&m).unwrap_or_else(|e| {
+                                panic!("send raft msg to {} failed: {:?}", m.to, e);
+                            });
+                        }
                     },
                     Err(_) => ()
                 }
@@ -84,13 +91,17 @@ impl KvServer {
         });
     }
 
-    fn start_op(&mut self, req: KvReq) -> (RespErr, String) {
+    fn start_op(&mut self, req: &KvReq) -> (RespErr, String) {
         let (sh, rh) = mpsc::sync_channel(0);
         {
             let mut map = self.notify_ch_map.lock().unwrap();
             map.insert(req.get_seq(), sh);
         }
-        self.rf_message_ch.send(peer::PeerMessage::Propose(req.write_to_bytes().unwrap()));
+        self.rf_message_ch.send(
+            PeerMessage::Propose(
+                req.write_to_bytes().unwrap()
+            )
+        ).unwrap();
         match rh.recv_timeout(Duration::from_millis(1000)) {
             Ok(args) => {
                 return (args.2, args.1);
@@ -106,14 +117,15 @@ impl KvServer {
     }
 
     fn async_applier(&mut self, apply_receiver: Receiver<Entry>) {
+        let peers = self.peers.clone();
         let notify_ch_map = self.notify_ch_map.clone();
         let engine = self.engine.clone();
         thread::spawn(move || {
             loop {
-                let mut result: NotifyArgs;
-                let index;
                 match apply_receiver.recv() {
                     Ok(e) => {
+                        let mut result: NotifyArgs;
+                        let index;
                         let req: KvReq = util::parse_data(&e.data);
                         index = req.seq;
                         if e.data.len() > 0 {
@@ -121,14 +133,15 @@ impl KvServer {
                         } else {
                             result = NotifyArgs(0, String::from(""), RespErr::ErrWrongLeader);
                         }
+
+                        let mut map = notify_ch_map.lock().unwrap();
+                        if let Some(s) = map.get(&index) {
+                            s.send(result).unwrap();
+                        }
+                        map.remove(&index);
                     },
-                    Err(_) => continue,
+                    Err(_) => (),
                 }
-                let mut map = notify_ch_map.lock().unwrap();
-                if let Some(s) = map.get(&index) {
-                    s.send(result).unwrap();
-                }
-                map.remove(&index);
             }
         });
     }
@@ -164,18 +177,64 @@ impl KvServer {
 
 impl Kv for KvServer {
     fn get(&mut self, ctx: RpcContext, req: KvReq, sink: UnarySink<GetResp>) {
-
+        let (err, value) = Self::start_op(self, &req);
+        let mut resp = GetResp::new();
+        resp.set_err(err);
+        resp.set_value(value);
+        ctx.spawn(
+            sink.success(resp).map_err(
+                move |e| println!("failed to reply {:?}: {:?}", req, e)
+            )
+        )
     }
 
     fn put(&mut self, ctx: RpcContext, req: KvReq, sink: UnarySink<PutResp>) {
-
+        let (err, _) = Self::start_op(self, &req);
+        let mut resp = PutResp::new();
+        resp.set_err(err);
+        ctx.spawn(
+            sink.success(resp).map_err(
+                move |e| println!("failed to reply {:?}: {:?}", req, e)
+            )
+        )
     }
 
     fn delete(&mut self, ctx: RpcContext, req: KvReq, sink: UnarySink<DeleteResp>) {
-
+        let (err, _) = Self::start_op(self, &req);
+        let mut resp = DeleteResp::new();
+        resp.set_err(err);
+        ctx.spawn(
+            sink.success(resp).map_err(
+                move |e| println!("failed to reply {:?}: {:?}", req, e)
+            )
+        )
     }
 
     fn raft(&mut self, ctx: RpcContext, req: RaftMessage, sink: UnarySink<RaftDone>) {
+        self.rf_message_ch.send(PeerMessage::Message(req.clone())).unwrap();
+        let resp = RaftDone::new();
+        ctx.spawn(
+            sink.success(resp).map_err(
+                move |e| println!("failed to reply {:?}: {:?}", req, e)
+            )
+        )
+    }
 
+    fn raft_conf_change(&mut self, ctx: RpcContext, req: ConfChangeReq, sink: UnarySink<RaftDone>) {
+        let cc = req.cc.clone().unwrap();
+        if cc.change_type == ConfChangeType::AddNode && cc.change_type == ConfChangeType::AddLearnerNode {
+            let mut peers = self.peers.lock().unwrap();
+            let env = Arc::new(EnvBuilder::new().build());
+            let addr = format!("{}:{}", req.ip, req.port);
+            let ch = ChannelBuilder::new(env).connect(&addr);
+            peers.insert(cc.node_id, KvClient::new(ch));
+        }
+        self.rf_message_ch.send(PeerMessage::ConfChange(cc)).unwrap();
+        let resp = RaftDone::new();
+        ctx.spawn(
+            sink.success(resp).map_err(
+                move |e| println!("failed to reply {:?}: {:?}", req, e)
+            )
+        )
     }
 }

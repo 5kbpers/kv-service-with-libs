@@ -46,6 +46,13 @@ const METHOD_KV_RAFT: ::grpcio::Method<super::eraftpb::Message, super::kvrpcpb::
     resp_mar: ::grpcio::Marshaller { ser: ::grpcio::pb_ser, de: ::grpcio::pb_de },
 };
 
+const METHOD_KV_RAFT_CONF_CHANGE: ::grpcio::Method<super::kvrpcpb::ConfChangeReq, super::kvrpcpb::RaftDone> = ::grpcio::Method {
+    ty: ::grpcio::MethodType::Unary,
+    name: "/kvpb.kv/RaftConfChange",
+    req_mar: ::grpcio::Marshaller { ser: ::grpcio::pb_ser, de: ::grpcio::pb_de },
+    resp_mar: ::grpcio::Marshaller { ser: ::grpcio::pb_ser, de: ::grpcio::pb_de },
+};
+
 #[derive(Clone)]
 pub struct KvClient {
     client: ::grpcio::Client,
@@ -121,6 +128,22 @@ impl KvClient {
     pub fn raft_async(&self, req: &super::eraftpb::Message) -> ::grpcio::Result<::grpcio::ClientUnaryReceiver<super::kvrpcpb::RaftDone>> {
         self.raft_async_opt(req, ::grpcio::CallOption::default())
     }
+
+    pub fn raft_conf_change_opt(&self, req: &super::kvrpcpb::ConfChangeReq, opt: ::grpcio::CallOption) -> ::grpcio::Result<super::kvrpcpb::RaftDone> {
+        self.client.unary_call(&METHOD_KV_RAFT_CONF_CHANGE, req, opt)
+    }
+
+    pub fn raft_conf_change(&self, req: &super::kvrpcpb::ConfChangeReq) -> ::grpcio::Result<super::kvrpcpb::RaftDone> {
+        self.raft_conf_change_opt(req, ::grpcio::CallOption::default())
+    }
+
+    pub fn raft_conf_change_async_opt(&self, req: &super::kvrpcpb::ConfChangeReq, opt: ::grpcio::CallOption) -> ::grpcio::Result<::grpcio::ClientUnaryReceiver<super::kvrpcpb::RaftDone>> {
+        self.client.unary_call_async(&METHOD_KV_RAFT_CONF_CHANGE, req, opt)
+    }
+
+    pub fn raft_conf_change_async(&self, req: &super::kvrpcpb::ConfChangeReq) -> ::grpcio::Result<::grpcio::ClientUnaryReceiver<super::kvrpcpb::RaftDone>> {
+        self.raft_conf_change_async_opt(req, ::grpcio::CallOption::default())
+    }
     pub fn spawn<F>(&self, f: F) where F: ::futures::Future<Item = (), Error = ()> + Send + 'static {
         self.client.spawn(f)
     }
@@ -131,6 +154,7 @@ pub trait Kv {
     fn put(&mut self, ctx: ::grpcio::RpcContext, req: super::kvrpcpb::KvReq, sink: ::grpcio::UnarySink<super::kvrpcpb::PutResp>);
     fn delete(&mut self, ctx: ::grpcio::RpcContext, req: super::kvrpcpb::KvReq, sink: ::grpcio::UnarySink<super::kvrpcpb::DeleteResp>);
     fn raft(&mut self, ctx: ::grpcio::RpcContext, req: super::eraftpb::Message, sink: ::grpcio::UnarySink<super::kvrpcpb::RaftDone>);
+    fn raft_conf_change(&mut self, ctx: ::grpcio::RpcContext, req: super::kvrpcpb::ConfChangeReq, sink: ::grpcio::UnarySink<super::kvrpcpb::RaftDone>);
 }
 
 pub fn create_kv<S: Kv + Send + Clone + 'static>(s: S) -> ::grpcio::Service {
@@ -150,6 +174,10 @@ pub fn create_kv<S: Kv + Send + Clone + 'static>(s: S) -> ::grpcio::Service {
     let mut instance = s.clone();
     builder = builder.add_unary_handler(&METHOD_KV_RAFT, move |ctx, req, resp| {
         instance.raft(ctx, req, resp)
+    });
+    let mut instance = s.clone();
+    builder = builder.add_unary_handler(&METHOD_KV_RAFT_CONF_CHANGE, move |ctx, req, resp| {
+        instance.raft_conf_change(ctx, req, resp)
     });
     builder.build()
 }

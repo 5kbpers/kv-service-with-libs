@@ -9,4 +9,5 @@ service kv {
   rpc Put(kvrpcpb.KvReq) returns (kvrpcpb.PutResp) {}
   rpc Delete(kvrpcpb.KvReq) returns (kvrpcpb.DeleteResp) {}
   rpc Raft(eraftpb.Message) returns(kvrpcpb.RaftDone) {}
+  rpc RaftConfChange(kvrpcpb.ConfChangeReq) returns(kvrpcpb.RaftDone) {}
 }
