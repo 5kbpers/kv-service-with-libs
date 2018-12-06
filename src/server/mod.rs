@@ -14,9 +14,8 @@ use protobuf::Message;
 use futures::sync::oneshot;
 use futures::Future;
 use grpcio::{Environment, RpcContext, ServerBuilder, UnarySink, EnvBuilder, ChannelBuilder};
-use raft::eraftpb::{Message as RaftMessage, Entry, ConfChange, EntryType, ConfChangeType};
+use raft::eraftpb::{Message as RaftMessage, Entry, ConfChangeType};
 
-use super::kvproto;
 use super::kvproto::kvpb_grpc::{self, Kv, KvClient};
 use super::kvproto::kvrpcpb::*;
 use self::peer::PeerMessage;
@@ -33,27 +32,41 @@ pub struct KvServer {
 }
 
 impl KvServer {
-    pub fn start_server(id: u64, engine: Arc<DB>, host: &str, port: u16) {
-        let (apply_sender, apply_receiver) = mpsc::sync_channel(100);
-        let rf = peer::Peer::new(id, apply_sender);
+    pub fn start_server(
+        id: u64, 
+        engine: Arc<DB>, 
+        host: &str,
+        port: u16, 
+        peers: HashMap<u64, KvClient>
+    ) {
         let (rf_sender, rf_receiver) = mpsc::sync_channel(100);
         let (rpc_sender, rpc_receiver) = mpsc::sync_channel(100);
+        let (apply_sender, apply_receiver) = mpsc::sync_channel(100);
+
+        let peers_id = peers.keys().map(|id| { *id }).collect();
+        let rf = peer::Peer::new(id, apply_sender, peers_id);
+
         let mut kv_server = KvServer{
             id, 
-            peers: Arc::new(Mutex::new(HashMap::new())), 
+            peers: Arc::new(Mutex::new(peers)), 
             engine,
             rf_message_ch: rf_sender,
             notify_ch_map: Arc::new(Mutex::new(HashMap::new())),
         };
+
         kv_server.async_rpc_sender(rpc_receiver);
         kv_server.async_applier(apply_receiver);
+
         let env = Arc::new(Environment::new(10));
         let service = kvpb_grpc::create_kv(kv_server);
         let mut server = ServerBuilder::new(env)
             .register_service(service)
             .bind(host, port)
             .build()
-            .unwrap();
+            .unwrap_or_else(|e| {
+                panic!("build server error: {}", e);
+            });
+
         peer::Peer::activate(rf, rpc_sender, rf_receiver);
         server.start();
         for &(ref host, port) in server.bind_addrs() {
@@ -81,7 +94,8 @@ impl KvServer {
                         let client = peers.get(&m.to);
                         if let Some(c) = client {
                             c.raft(&m).unwrap_or_else(|e| {
-                                panic!("send raft msg to {} failed: {:?}", m.to, e);
+                                println!("send raft msg to {} failed: {:?}", m.to, e);
+                                RaftDone::new()
                             });
                         }
                     },
@@ -99,9 +113,13 @@ impl KvServer {
         }
         self.rf_message_ch.send(
             PeerMessage::Propose(
-                req.write_to_bytes().unwrap()
+                req.write_to_bytes().unwrap_or_else(|e| {
+                    panic!("request write to bytes error: {}", e);
+                })
             )
-        ).unwrap();
+        ).unwrap_or_else(|e| {
+            panic!("send propose to raft error: {}", e);
+        });
         match rh.recv_timeout(Duration::from_millis(1000)) {
             Ok(args) => {
                 return (args.2, args.1);
@@ -116,8 +134,8 @@ impl KvServer {
         }
     }
 
+    // TODO: check duplicate request.
     fn async_applier(&mut self, apply_receiver: Receiver<Entry>) {
-        let peers = self.peers.clone();
         let notify_ch_map = self.notify_ch_map.clone();
         let engine = self.engine.clone();
         thread::spawn(move || {
@@ -136,7 +154,9 @@ impl KvServer {
 
                         let mut map = notify_ch_map.lock().unwrap();
                         if let Some(s) = map.get(&index) {
-                            s.send(result).unwrap();
+                            s.send(result).unwrap_or_else(|e| {
+                                panic!("notify apply result error: {}", e);
+                            });
                         }
                         map.remove(&index);
                     },
@@ -211,7 +231,11 @@ impl Kv for KvServer {
     }
 
     fn raft(&mut self, ctx: RpcContext, req: RaftMessage, sink: UnarySink<RaftDone>) {
-        self.rf_message_ch.send(PeerMessage::Message(req.clone())).unwrap();
+        self.rf_message_ch
+            .send(PeerMessage::Message(req.clone()))
+            .unwrap_or_else(|e| {
+                panic!("send message to raft error: {}", e);
+            });
         let resp = RaftDone::new();
         ctx.spawn(
             sink.success(resp).map_err(

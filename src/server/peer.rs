@@ -1,9 +1,7 @@
 use std::thread;
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{self, SyncSender, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{SyncSender, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use rocksdb::DB;
 use raft::eraftpb::{Entry, EntryType, Message, ConfChange};
 use raft::{self, RawNode};
 
@@ -28,8 +26,9 @@ impl Peer {
     pub fn new(
         id: u64,
         apply_ch: SyncSender<Entry>,
+        peers: Vec<u64>
     ) -> Peer {
-        let cfg =  util::default_raft_config(id, vec![]);
+        let cfg =  util::default_raft_config(id, peers);
         let storge = PeerStorage::new();
         Peer {
             raft_group: RawNode::new(&cfg, storge, vec![]).unwrap(),
@@ -43,10 +42,6 @@ impl Peer {
         thread::spawn(move || {
             peer.listen_message(sender, receiver);
         });
-    }
-
-    pub fn ready(&mut self) -> raft::Ready {
-        self.raft_group.ready()
     }
 
     fn listen_message(&mut self, sender: SyncSender<Message>, receiver: Receiver<PeerMessage>) {
@@ -92,6 +87,7 @@ impl Peer {
         let mut ready = self.raft_group.ready();
         let is_leader = self.raft_group.raft.leader_id == self.raft_group.raft.id;
         if is_leader {
+            println!("I'm leader");
             let msgs = ready.messages.drain(..);
             for _msg in msgs {
                 Self::send_message(sender.clone(), _msg.clone());
@@ -148,14 +144,18 @@ impl Peer {
 
     fn send_message(sender: SyncSender<Message>, msg: Message) {
         thread::spawn(move || {
-            sender.send(msg).unwrap();
+            sender.send(msg).unwrap_or_else(|e| {
+                panic!("raft send message error: {}", e);
+            });
         });
     }
 
     fn apply_message(&self, entry: Entry) {
         let sender = self.apply_ch.clone();
         thread::spawn(move || {
-            sender.send(entry).unwrap();
+            sender.send(entry).unwrap_or_else(|e| {
+                panic!("raft send apply entry error: {}", e);
+            });
         });
     }
 }
