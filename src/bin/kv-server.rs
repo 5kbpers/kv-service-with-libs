@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use clap::{App, Arg};
 use kv::server::KvServer;
 use kv::kvproto::kvpb_grpc::KvClient;
+use kv::kvproto::kvrpcpb::{ConfChangeReq, RaftDone, RespErr};
+use raft::eraftpb::{ConfChange, ConfChangeType};
 use grpcio::{EnvBuilder, ChannelBuilder};
 use rocksdb::{self, DB, DBOptions};
 
@@ -25,6 +27,37 @@ fn create_db(path: &str) -> DB {
     let mut opts = DBOptions::new();
     opts.create_if_missing(true);
     DB::open(opts, path).unwrap()
+}
+
+
+pub fn conf_change(self_id:u64, leader_id: u64, peers: &HashMap<u64, KvClient>, req: ConfChangeReq) {
+    let client = peers.get(&leader_id).unwrap();
+    let reply = client.raft_conf_change(&req).unwrap_or_else(|e| {
+        let mut resp = RaftDone::new();
+        resp.set_err(RespErr::ErrWrongLeader);
+        resp
+    });
+    match reply.err {
+        RespErr::OK => return,
+        RespErr::ErrWrongLeader => (),
+        RespErr::ErrNoKey => return,
+    }
+    loop {
+        for (id, client) in peers.iter() {
+            if *id != self_id {
+                let reply = client.raft_conf_change(&req).unwrap_or_else(|e| {
+                    let mut resp = RaftDone::new();
+                    resp.set_err(RespErr::ErrWrongLeader);
+                    resp
+                });
+                match reply.err {
+                    RespErr::OK => return,
+                    RespErr::ErrWrongLeader => (),
+                    RespErr::ErrNoKey => return,
+                }
+            }
+        }
+    }
 }
 
 fn main() {
@@ -66,6 +99,13 @@ fn main() {
                 .require_delimiter(true)
                 .value_delimiter(",")
                 .long_help("Set raft peers. Use `,` to separate address"),
+        ).arg(
+            Arg::with_name("addto")
+                .short("d")
+                .long("addto")
+                .value_name("IP")
+                .help("Add to raft cluster")
+                .takes_value(true),
         ).get_matches();
 
     println!("start server...");
@@ -96,5 +136,20 @@ fn main() {
     fs::create_dir_all(&raft_path).unwrap_or_default();
 
     let kvdb = create_db(kv_path.to_str().unwrap());
+
+    if let Some(addto_str) = matches.value_of("addto") {
+        let addto = addto_str.parse::<u64>().unwrap();
+        let mut cc = ConfChange::new();
+        cc.set_id(id);
+        cc.set_node_id(id);
+        cc.set_change_type(ConfChangeType::AddNode);
+        let mut req = ConfChangeReq::new();
+        req.set_cc(cc);
+        req.set_ip(host.to_owned());
+        req.set_port(port as u32);
+        conf_change(id, addto, &peers, req);
+        println!("add to raft cluster success");
+    }
+
     KvServer::start_server(id, Arc::new(kvdb), host, port, peers);
 }

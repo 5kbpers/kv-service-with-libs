@@ -1,6 +1,7 @@
 use std::thread;
 use std::sync::mpsc::{SyncSender, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use raft::eraftpb::{Entry, EntryType, Message, ConfChange};
 use raft::{self, RawNode};
@@ -20,6 +21,7 @@ pub struct Peer {
     last_applying_idx: u64,
     last_compacted_idx: u64,
     apply_ch: SyncSender<Entry>,
+    peers_addr: HashMap<u64, (String, u32)>,
 }
 
 impl Peer {
@@ -35,6 +37,7 @@ impl Peer {
             last_applying_idx: 0,
             last_compacted_idx: 0,
             apply_ch,
+            peers_addr: HashMap::new(),
         }
     }
 
@@ -69,7 +72,7 @@ impl Peer {
             let d = t.elapsed();
             if d >= timeout{
                 t = Instant::now();
-                timeout = Duration::from_millis(100);
+                timeout = Duration::from_millis(200);
                 self.raft_group.tick();
             } else {
                 timeout -= d;
@@ -110,8 +113,14 @@ impl Peer {
         }
 
         if !is_leader {
-            let msgs = ready.messages.drain(..);
-            for _msg in msgs {
+            println!("I'm follower");
+            let mut msgs = ready.messages.drain(..);
+            for mut _msg in msgs {
+                for _entry in _msg.mut_entries().iter() {
+                    if _entry.get_entry_type() == EntryType::EntryConfChange {
+
+                    }
+                }
                 Self::send_message(sender.clone(), _msg.clone());
             }
         }
@@ -133,6 +142,8 @@ impl Peer {
                     EntryType::EntryConfChange => {
                         let cc = util::parse_data(&entry.data);
                         self.raft_group.apply_conf_change(&cc);
+                        println!("-----------apply conf change");
+                        self.apply_message(entry.clone());
                     }
                 }
             }

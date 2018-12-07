@@ -6,12 +6,14 @@ import "eraftpb.proto";
 enum RespErr {
   OK = 0;
   ErrWrongLeader = 1;
+  ErrNoKey = 2;
 }
 
 enum ReqType {
   Get = 0;
   Put = 1;
   Delete = 2;
+  PeerAddr = 3;
 }
 
 message KvReq {
@@ -20,6 +22,8 @@ message KvReq {
   uint64 client_id = 3;
   uint64 seq = 4;
   ReqType req_type = 5;
+  uint64 peer_id = 6;
+  string peer_addr = 7;
 }
 
 message ConfChangeReq {
@@ -41,4 +45,6 @@ message DeleteResp {
   RespErr err = 1;
 }
 
-message RaftDone {}
+message RaftDone {
+  RespErr err = 1;
+}

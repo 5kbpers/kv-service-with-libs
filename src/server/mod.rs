@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
-use std::sync::mpsc::{self, SyncSender, Receiver};
+use std::sync::mpsc::{self,  SyncSender, Receiver};
 
 use rocksdb::DB;
 use rocksdb::Writable;
@@ -14,7 +14,7 @@ use protobuf::Message;
 use futures::sync::oneshot;
 use futures::Future;
 use grpcio::{Environment, RpcContext, ServerBuilder, UnarySink, EnvBuilder, ChannelBuilder};
-use raft::eraftpb::{Message as RaftMessage, Entry, ConfChangeType};
+use raft::eraftpb::{Message as RaftMessage, Entry, EntryType, ConfChange, ConfChangeType};
 
 use super::kvproto::kvpb_grpc::{self, Kv, KvClient};
 use super::kvproto::kvrpcpb::*;
@@ -91,11 +91,14 @@ impl KvServer {
                 match receiver.recv() {
                     Ok(m) => {
                         let peers = l.lock().unwrap();
-                        let client = peers.get(&m.to);
-                        if let Some(c) = client {
-                            c.raft(&m).unwrap_or_else(|e| {
-                                println!("send raft msg to {} failed: {:?}", m.to, e);
-                                RaftDone::new()
+                        let op = peers.get(&m.to);
+                        if let Some(c) = op {
+                            let client = c.clone();
+                            thread::spawn(move || {
+                                client.raft(&m).unwrap_or_else(|e| {
+                                    println!("send raft msg to {} failed: {:?}", m.to, e);
+                                    RaftDone::new()
+                                });
                             });
                         }
                     },
@@ -109,7 +112,7 @@ impl KvServer {
         let (sh, rh) = mpsc::sync_channel(0);
         {
             let mut map = self.notify_ch_map.lock().unwrap();
-            map.insert(req.get_seq(), sh);
+            map.insert(req.get_client_id(), sh);
         }
         self.rf_message_ch.send(
             PeerMessage::Propose(
@@ -127,7 +130,7 @@ impl KvServer {
             Err(_) => {
                 {
                     let mut map = self.notify_ch_map.lock().unwrap();
-                    map.remove(&req.get_seq());
+                    map.remove(&req.get_client_id());
                 }
                 return (RespErr::ErrWrongLeader, String::from(""));
             }
@@ -138,27 +141,43 @@ impl KvServer {
     fn async_applier(&mut self, apply_receiver: Receiver<Entry>) {
         let notify_ch_map = self.notify_ch_map.clone();
         let engine = self.engine.clone();
+        let peers = self.peers.clone();
         thread::spawn(move || {
             loop {
                 match apply_receiver.recv() {
                     Ok(e) => {
-                        let mut result: NotifyArgs;
-                        let index;
-                        let req: KvReq = util::parse_data(&e.data);
-                        index = req.seq;
-                        if e.data.len() > 0 {
-                            result = Self::apply_entry(e.term, &req, engine.clone());
-                        } else {
-                            result = NotifyArgs(0, String::from(""), RespErr::ErrWrongLeader);
+                        match e.get_entry_type() {
+                            EntryType::EntryNormal => {
+                                let mut result: NotifyArgs;
+                                let req: KvReq = util::parse_data(e.get_data());
+                                let index = req.get_client_id();
+                                if e.data.len() > 0 {
+                                    result = Self::apply_entry(e.term, &req, engine.clone(), peers.clone());
+                                    println!("apply_entry: {:?}---{:?}", req, result.2);
+                                } else {
+                                    result = NotifyArgs(0, String::from(""), RespErr::ErrWrongLeader);
+                                    println!("empty_entry: {:?}", req);
+                                }
+                                let mut map = notify_ch_map.lock().unwrap();
+                                if let Some(s) = map.get(&index) {
+                                    s.send(result).unwrap_or_else(|e| {
+                                        panic!("notify apply result error: {}", e);
+                                    });
+                                }
+                                map.remove(&index);
+                            },
+                            EntryType::EntryConfChange => {
+                                let result = NotifyArgs(0, String::from(""), RespErr::OK);
+                                let cc: ConfChange = util::parse_data(e.get_data());
+                                let mut map = notify_ch_map.lock().unwrap();
+                                if let Some(s) = map.get(&cc.get_node_id()) {
+                                    s.send(result).unwrap_or_else(|e| {
+                                        panic!("notify apply result error: {}", e);
+                                    });
+                                }
+                                map.remove(&cc.get_node_id());
+                            }
                         }
-
-                        let mut map = notify_ch_map.lock().unwrap();
-                        if let Some(s) = map.get(&index) {
-                            s.send(result).unwrap_or_else(|e| {
-                                panic!("notify apply result error: {}", e);
-                            });
-                        }
-                        map.remove(&index);
                     },
                     Err(_) => (),
                 }
@@ -166,30 +185,65 @@ impl KvServer {
         });
     }
 
-    fn apply_entry(term: u64, req: &KvReq, engine: Arc<DB>) -> NotifyArgs {
+    fn apply_entry(
+        term: u64, 
+        req: &KvReq, 
+        engine: Arc<DB>, 
+        peers: Arc<Mutex<HashMap<u64, KvClient>>>
+    ) -> NotifyArgs {
+        let mut data_key = req.key.clone();
+        data_key.insert_str(0, "d_");
+        let mut seq_key = "c_".to_owned();
+        seq_key.push_str(&req.client_id.to_string());
+        if req.req_type != ReqType::Get {
+            if let Ok(op) = engine.get(seq_key.as_bytes()) {
+                if let Some(s) = op {
+                    let max_seq: u64 = s.to_utf8().unwrap().parse().unwrap();
+                    if max_seq >= req.seq {
+                        return NotifyArgs(term, String::from(""), RespErr::ErrNoKey);
+                    }
+                }
+            }
+        }
         match req.req_type {
             ReqType::Get => {
-                match engine.get(req.key.as_bytes()) {
+                match engine.get(data_key.as_bytes()) {
                     Ok(op) => {
                         match op {
                             Some(v) => NotifyArgs(term, String::from(v.to_utf8().unwrap()), RespErr::OK),
-                            None => NotifyArgs(term, String::from(""), RespErr::ErrWrongLeader),
+                            None => NotifyArgs(term, String::from(""), RespErr::ErrNoKey),
                         }
                     },
                     Err(_) => NotifyArgs(term, String::from(""), RespErr::ErrWrongLeader),
                 }
             },
             ReqType::Put => {
-                match engine.put(req.key.as_bytes(), req.value.as_bytes()) {
-                    Ok(_) => NotifyArgs(term, String::from(""), RespErr::OK),
-                    Err(_) => NotifyArgs(term, String::from(""), RespErr::ErrWrongLeader),
+                match engine.put(data_key.as_bytes(), req.value.as_bytes()) {
+                    Ok(_) => {
+                        engine.put(seq_key.as_bytes(), req.seq.to_string().as_bytes()).unwrap();
+                        NotifyArgs(term, String::from(""), RespErr::OK)
+                    },
+                    Err(e) => {
+                        println!("put key error: {}", e);
+                        NotifyArgs(term, String::from(""), RespErr::ErrWrongLeader)
+                    }
                 }
             },
             ReqType::Delete => {
-                match engine.delete(req.key.as_bytes()) {
-                    Ok(_) => NotifyArgs(term, String::from(""), RespErr::OK),
+                match engine.delete(data_key.as_bytes()) {
+                    Ok(_) => {
+                        engine.put(seq_key.as_bytes(), req.seq.to_string().as_bytes()).unwrap();
+                        NotifyArgs(term, String::from(""), RespErr::OK)
+                    },
                     Err(_) => NotifyArgs(term, String::from(""), RespErr::ErrWrongLeader),
                 }
+            },
+            ReqType::PeerAddr => {
+                let mut prs = peers.lock().unwrap();
+                let env = Arc::new(EnvBuilder::new().build());
+                let ch = ChannelBuilder::new(env).connect(&req.peer_addr);
+                prs.insert(req.peer_id, KvClient::new(ch));
+                NotifyArgs(term, String::from(""), RespErr::OK)
             }
         }
     }
@@ -246,15 +300,29 @@ impl Kv for KvServer {
 
     fn raft_conf_change(&mut self, ctx: RpcContext, req: ConfChangeReq, sink: UnarySink<RaftDone>) {
         let cc = req.cc.clone().unwrap();
-        if cc.change_type == ConfChangeType::AddNode && cc.change_type == ConfChangeType::AddLearnerNode {
-            let mut peers = self.peers.lock().unwrap();
-            let env = Arc::new(EnvBuilder::new().build());
-            let addr = format!("{}:{}", req.ip, req.port);
-            let ch = ChannelBuilder::new(env).connect(&addr);
-            peers.insert(cc.node_id, KvClient::new(ch));
+        let mut resp = RaftDone::new();
+        let mut peer_req = KvReq::new();
+        peer_req.set_req_type(ReqType::PeerAddr);
+        peer_req.set_peer_addr(format!("{}:{}", req.ip, req.port));
+        peer_req.set_peer_id(cc.get_node_id());
+        peer_req.set_client_id(cc.get_node_id());
+        let (err, _) = self.start_op(&peer_req);
+        match err {
+            RespErr::OK => {
+                let (sh, rh) = mpsc::sync_channel(0);
+                {
+                    let mut map = self.notify_ch_map.lock().unwrap();
+                    map.insert(cc.get_node_id(), sh);
+                }
+                self.rf_message_ch.send(PeerMessage::ConfChange(cc.clone())).unwrap();
+                match rh.recv_timeout(Duration::from_millis(1000)) {
+                    Ok(_) => resp.set_err(RespErr::OK),
+                    Err(_) => resp.set_err(RespErr::ErrWrongLeader),
+                }
+            },
+            _ => resp.set_err(RespErr::ErrWrongLeader),
         }
-        self.rf_message_ch.send(PeerMessage::ConfChange(cc)).unwrap();
-        let resp = RaftDone::new();
+
         ctx.spawn(
             sink.success(resp).map_err(
                 move |e| println!("failed to reply {:?}: {:?}", req, e)

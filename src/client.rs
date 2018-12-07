@@ -30,10 +30,15 @@ impl Clerk {
         self.request_seq += 1;
 
         loop {
-            let reply = self.servers[self.leader_id].get(&req).unwrap();
+            let reply = self.servers[self.leader_id].get(&req).unwrap_or_else(|e| {
+                let mut resp = GetResp::new();
+                resp.set_err(RespErr::ErrWrongLeader);
+                resp
+            });
             match reply.err {
                 RespErr::OK => return reply.value,
                 RespErr::ErrWrongLeader => (),
+                RespErr::ErrNoKey => return String::from(""),
             }
             self.leader_id = (self.leader_id + 1) % self.servers.len();
             thread::sleep(Duration::from_millis(100));
@@ -43,18 +48,24 @@ impl Clerk {
     pub fn put(&mut self, key: &str, value: &str) {
         let mut req = KvReq::new();
         req.set_client_id(self.client_id);
-        req.set_req_type(ReqType::Get);
+        req.set_req_type(ReqType::Put);
         req.set_key(key.to_owned());
         req.set_value(value.to_owned());
         req.set_seq(self.request_seq);
         self.request_seq += 1;
 
         loop {
-            let reply = self.servers[self.leader_id].put(&req).unwrap();
+            let reply = self.servers[self.leader_id].put(&req).unwrap_or_else(|e| {
+                let mut resp = PutResp::new();
+                resp.set_err(RespErr::ErrWrongLeader);
+                resp
+            });
             match reply.err {
                 RespErr::OK => return,
                 RespErr::ErrWrongLeader => (),
+                RespErr::ErrNoKey => return,
             }
+            println!("put redo: {}", self.leader_id);
             self.leader_id = (self.leader_id + 1) % self.servers.len();
             thread::sleep(Duration::from_millis(100));
         }
@@ -63,16 +74,21 @@ impl Clerk {
     pub fn delete(&mut self, key: &str) {
         let mut req = KvReq::new();
         req.set_client_id(self.client_id);
-        req.set_req_type(ReqType::Get);
+        req.set_req_type(ReqType::Delete);
         req.set_key(key.to_owned());
         req.set_seq(self.request_seq);
         self.request_seq += 1;
 
         loop {
-            let reply = self.servers[self.leader_id].delete(&req).unwrap();
+            let reply = self.servers[self.leader_id].delete(&req).unwrap_or_else(|e| {
+                let mut resp = DeleteResp::new();
+                resp.set_err(RespErr::ErrWrongLeader);
+                resp
+            });
             match reply.err {
                 RespErr::OK => return,
                 RespErr::ErrWrongLeader => (),
+                RespErr::ErrNoKey => return,
             }
             self.leader_id = (self.leader_id + 1) % self.servers.len();
             thread::sleep(Duration::from_millis(100));

@@ -2,8 +2,6 @@ extern crate kv;
 extern crate rand;
 extern crate clap;
 extern crate grpcio;
-#[macro_use]
-extern crate quicli;
 
 use std::sync::Arc;
 
@@ -41,9 +39,10 @@ fn main() {
             servers.push(create_client(addr));
         })
         .count();
-    }
+    } 
     let client_id = rand::random();
     let mut client = Clerk::new(&servers, client_id);
     client.put("k", "2333333333333");
+    println!("put k");
     println!("value of k is {}", client.get("k"));
 }
